@@ -27,7 +27,7 @@ if (!process.env.VERCEL && !fs.existsSync(IMAGE_CACHE_DIR)) {
 
 // 访问密码配置（支持多密码）
 // 格式：ACCESS_PASSWORD=password1 或 ACCESS_PASSWORD=password1,password2,password3
-const ACCESS_PASSWORD_RAW = process.env.ACCESS_PASSWORD || '';
+const ACCESS_PASSWORD_RAW = process.env['ACCESS_PASSWORD'] || '';
 const ACCESS_PASSWORDS = ACCESS_PASSWORD_RAW ? ACCESS_PASSWORD_RAW.split(',').map(p => p.trim()).filter(p => p) : [];
 
 // 第一个密码的哈希（兼容旧逻辑）
@@ -49,19 +49,140 @@ ACCESS_PASSWORDS.forEach((pwd, index) => {
 console.log(`[System] Password mode: ${ACCESS_PASSWORDS.length > 1 ? 'Multi-user' : 'Single'} (${ACCESS_PASSWORDS.length} passwords)`);
 
 // 远程配置URL
-const REMOTE_DB_URL = process.env.REMOTE_DB_URL || '';
+const REMOTE_DB_URL = process.env['REMOTE_DB_URL'] || '';
+
+// CORS 代理 URL（用于中转无法直接访问的资源站 API）
+const CORS_PROXY_URL = process.env['CORS_PROXY_URL'] || '';
 
 // 环境变量加载状态日志（用于 Vercel 调试）
 console.log(`[System] Environment: ${process.env.VERCEL ? 'Vercel Serverless' : 'Local/VPS'}`);
 console.log(`[System] TMDB_API_KEY: ${process.env.TMDB_API_KEY ? '✓ Configured' : '✗ Missing'}`);
-console.log(`[System] TMDB_PROXY_URL: ${process.env.TMDB_PROXY_URL || '(not set)'}`);
+console.log(`[System] TMDB_PROXY_URL: ${process.env['TMDB_PROXY_URL'] || '(not set)'}`);
+console.log(`[System] CORS_PROXY_URL: ${CORS_PROXY_URL || '(not set)'}`);
 console.log(`[System] REMOTE_DB_URL: ${REMOTE_DB_URL ? '✓ Configured' : '(not set)'}`);
+
 
 
 // 远程配置缓存
 let remoteDbCache = null;
 let remoteDbLastFetch = 0;
 const REMOTE_DB_CACHE_TTL = 5 * 60 * 1000; // 5分钟缓存
+
+// 记录需要使用代理的站点（自动学习，带过期时间）
+// 格式：{ siteKey: expireTimestamp }
+const proxyRequiredSites = new Map();
+const PROXY_MEMORY_TTL = 24 * 60 * 60 * 1000; // 24小时后重新尝试直连
+const SLOW_THRESHOLD_MS = 1500; // 直连延迟超过此值视为慢速，尝试代理
+
+/**
+ * 检查站点是否需要使用代理（未过期）
+ */
+function shouldUseProxy(siteKey) {
+    if (!proxyRequiredSites.has(siteKey)) return false;
+    const expireTime = proxyRequiredSites.get(siteKey);
+    if (Date.now() > expireTime) {
+        // 已过期，移除记录，下次会重新尝试直连
+        proxyRequiredSites.delete(siteKey);
+        console.log(`[Proxy Memory] ${siteKey} 代理记录已过期，将重新尝试直连`);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * 标记站点需要使用代理
+ */
+function markSiteNeedsProxy(siteKey, reason = '') {
+    const expireTime = Date.now() + PROXY_MEMORY_TTL;
+    proxyRequiredSites.set(siteKey, expireTime);
+    const expireDate = new Date(expireTime).toLocaleString('zh-CN');
+    console.log(`[Proxy Memory] ${siteKey} 已标记为需要代理${reason ? ` (${reason})` : ''}，有效期至 ${expireDate}`);
+}
+
+/**
+ * 带代理回退的请求函数
+ * 先尝试直接请求，失败或太慢时通过 CORS 代理重试
+ * @param {string} url - 请求 URL
+ * @param {object} options - axios 配置
+ * @param {string} siteKey - 站点标识（用于记忆）
+ * @returns {Promise<object>} - { data, usedProxy, latency }
+ */
+async function fetchWithProxyFallback(url, options = {}, siteKey = '') {
+    const timeout = options.timeout || 8000;
+
+    // 如果该站点之前需要代理且未过期，直接使用代理
+    if (CORS_PROXY_URL && siteKey && shouldUseProxy(siteKey)) {
+        try {
+            const startTime = Date.now();
+            const proxyUrl = `${CORS_PROXY_URL}/?url=${encodeURIComponent(url)}`;
+            const response = await axios.get(proxyUrl, { ...options, timeout });
+            const latency = Date.now() - startTime;
+            return { data: response.data, usedProxy: true, latency };
+        } catch (proxyError) {
+            // 代理也失败，移除记忆，下次重新尝试直连
+            proxyRequiredSites.delete(siteKey);
+            console.log(`[Proxy Fallback] ${siteKey} 代理失败，已清除记录`);
+            throw proxyError;
+        }
+    }
+
+    // 尝试直接请求
+    const startTime = Date.now();
+    try {
+        const response = await axios.get(url, { ...options, timeout });
+        const directLatency = Date.now() - startTime;
+
+        // 检查是否太慢，如果配置了代理，尝试代理看是否更快
+        if (CORS_PROXY_URL && directLatency > SLOW_THRESHOLD_MS) {
+            console.log(`[Proxy Fallback] ${siteKey || url} 直连较慢 (${directLatency}ms)，尝试代理对比...`);
+
+            try {
+                const proxyStartTime = Date.now();
+                const proxyUrl = `${CORS_PROXY_URL}/?url=${encodeURIComponent(url)}`;
+                const proxyResponse = await axios.get(proxyUrl, { ...options, timeout: timeout + 2000 });
+                const proxyLatency = Date.now() - proxyStartTime;
+
+                // 如果代理更快（至少快 30%），使用代理结果并记住
+                if (proxyLatency < directLatency * 0.7) {
+                    console.log(`[Proxy Fallback] ${siteKey || url} 代理更快 (${proxyLatency}ms vs ${directLatency}ms)，使用代理`);
+                    if (siteKey) {
+                        markSiteNeedsProxy(siteKey, `代理更快: ${proxyLatency}ms vs 直连 ${directLatency}ms`);
+                    }
+                    return { data: proxyResponse.data, usedProxy: true, latency: proxyLatency };
+                } else {
+                    console.log(`[Proxy Fallback] ${siteKey || url} 直连仍更快 (${directLatency}ms vs ${proxyLatency}ms)，继续使用直连`);
+                }
+            } catch (proxyError) {
+                // 代理失败，继续使用直连结果
+                console.log(`[Proxy Fallback] ${siteKey || url} 代理测试失败，继续使用直连`);
+            }
+        }
+
+        return { data: response.data, usedProxy: false, latency: directLatency };
+    } catch (directError) {
+        // 直接请求失败，如果配置了代理，尝试通过代理
+        if (CORS_PROXY_URL) {
+            try {
+                console.log(`[Proxy Fallback] ${siteKey || url} 直连失败，尝试代理...`);
+                const proxyStartTime = Date.now();
+                const proxyUrl = `${CORS_PROXY_URL}/?url=${encodeURIComponent(url)}`;
+                const response = await axios.get(proxyUrl, { ...options, timeout: timeout + 2000 });
+                const proxyLatency = Date.now() - proxyStartTime;
+
+                // 记住该站点需要代理（带过期时间）
+                if (siteKey) {
+                    markSiteNeedsProxy(siteKey, '直连失败');
+                }
+
+                return { data: response.data, usedProxy: true, latency: proxyLatency };
+            } catch (proxyError) {
+                console.error(`[Proxy Fallback] ${siteKey || url} 代理请求也失败:`, proxyError.message);
+                throw proxyError;
+            }
+        }
+        throw directError;
+    }
+}
 
 // 缓存配置
 const CACHE_TYPE = process.env.CACHE_TYPE || 'json'; // json, sqlite, memory, none
@@ -241,27 +362,31 @@ app.use(bodyParser.json());
 // ========== API 速率限制 ==========
 const rateLimit = require('express-rate-limit');
 
-// 通用 API 限流：每 IP 每分钟最多 300 次请求
-// 注意：页面加载时会发送多个请求，多设备需要更高的限制
+// 通用 API 限流：每 IP 每分钟最多 600 次请求
+// 注意：页面加载时会发送大量图片和 API 请求，需要足够高的限制
 const apiLimiter = rateLimit({
     windowMs: 60 * 1000, // 1 分钟窗口
-    max: 300, // 每 IP 最多 300 次（约 5 次/秒）
+    max: 600, // 每 IP 最多 600 次（约 10 次/秒）
     standardHeaders: true, // 返回 RateLimit-* 标准头
     legacyHeaders: false, // 禁用 X-RateLimit-* 旧头
     message: { error: '请求过于频繁，请稍后再试 (Rate limit exceeded)' },
     skip: (req) => {
-        // 跳过静态资源请求和基础配置请求
+        // 跳过静态资源请求
         if (!req.path.startsWith('/api/')) return true;
-        // 配置和认证请求不限流（页面加载必需）
+        // 配置、认证、站点列表请求不限流（页面加载必需）
         if (req.path === '/api/config' || req.path.startsWith('/api/auth/') || req.path === '/api/sites') return true;
+        // 图片代理请求不限流（前端有大量图片）
+        if (req.path.startsWith('/api/tmdb-image/')) return true;
+        // TMDB 代理请求不限流
+        if (req.path === '/api/tmdb-proxy') return true;
         return false;
     }
 });
 
-// 搜索 API 更严格的限流：每 IP 每分钟最多 60 次搜索
+// 搜索 API 更严格的限流：每 IP 每分钟最多 120 次搜索
 const searchLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 60,
+    max: 120,
     message: { error: '搜索请求过于频繁，请稍后再试' }
 });
 
@@ -315,7 +440,9 @@ app.get('/api/config', (req, res) => {
 
     res.json({
         tmdb_api_key: process.env.TMDB_API_KEY,
-        tmdb_proxy_url: process.env.TMDB_PROXY_URL,
+        tmdb_proxy_url: process.env['TMDB_PROXY_URL'],
+        // CORS 代理 URL（用于中转无法直接访问的资源站 API）
+        cors_proxy_url: CORS_PROXY_URL || null,
         // Vercel 环境下禁用本地图片缓存，防止写入报错
         enable_local_image_cache: !IS_VERCEL,
         // 多用户同步功能
@@ -331,7 +458,7 @@ app.get('/api/debug', (req, res) => {
         node_version: process.version,
         env_status: {
             TMDB_API_KEY: process.env.TMDB_API_KEY ? 'configured' : 'missing',
-            TMDB_PROXY_URL: process.env.TMDB_PROXY_URL ? 'configured' : 'not_set',
+            TMDB_PROXY_URL: process.env['TMDB_PROXY_URL'] ? 'configured' : 'not_set',
             ACCESS_PASSWORD: ACCESS_PASSWORDS.length > 0 ? `${ACCESS_PASSWORDS.length} password(s)` : 'not_set',
             REMOTE_DB_URL: REMOTE_DB_URL ? 'configured' : 'not_set',
             CACHE_TYPE: process.env.CACHE_TYPE || 'json (default)'
@@ -430,6 +557,38 @@ app.post('/api/history/push', (req, res) => {
         res.json({ sync_enabled: true, saved: saved });
     } catch (e) {
         console.error('[History Push Error]', e.message);
+        res.status(500).json({ error: 'Database error' });
+    }
+});
+
+// 清除用户历史记录 (服务器端)
+app.post('/api/history/clear', (req, res) => {
+    const { token } = req.body;
+
+    if (!token) {
+        return res.status(400).json({ error: 'Missing token' });
+    }
+
+    // 验证 token
+    const userInfo = PASSWORD_HASH_MAP[token];
+    if (!userInfo) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    // 从 SQLite 删除该用户的所有历史
+    if (cacheManager.type !== 'sqlite' || !cacheManager.db) {
+        return res.json({ success: true, message: 'SQLite not available' });
+    }
+
+    try {
+        const deleteStmt = cacheManager.db.prepare(`
+            DELETE FROM user_history WHERE user_token = ?
+        `);
+        const result = deleteStmt.run(token);
+        console.log(`[History Clear] 用户 ${token.substring(0, 8)}... 删除了 ${result.changes} 条记录`);
+        res.json({ success: true, deleted: result.changes });
+    } catch (e) {
+        console.error('[History Clear Error]', e.message);
         res.status(500).json({ error: 'Database error' });
     }
 });
@@ -548,12 +707,17 @@ app.get('/api/search', async (req, res) => {
 
         try {
             console.log(`[SSE Search] ${site.name} -> ${keyword}`);
-            const response = await axios.get(site.api, {
-                params: { ac: 'detail', wd: keyword },
-                timeout: 8000
-            });
 
-            const data = response.data;
+            // 构建请求 URL（带参数）
+            const searchUrl = `${site.api}?ac=detail&wd=${encodeURIComponent(keyword)}`;
+
+            // 使用带代理回退的请求
+            const { data, usedProxy } = await fetchWithProxyFallback(searchUrl, { timeout: 8000 }, site.key);
+
+            if (usedProxy) {
+                console.log(`[SSE Search] ${site.name} 通过代理获取结果`);
+            }
+
             const list = data.list ? data.list.map(item => ({
                 vod_id: item.vod_id,
                 vod_name: item.vod_name,
@@ -607,12 +771,11 @@ app.post('/api/search', async (req, res) => {
 
     try {
         console.log(`[Search] ${site.name} -> ${keyword}`);
-        const response = await axios.get(site.api, {
-            params: { ac: 'detail', wd: keyword },
-            timeout: 8000
-        });
 
-        const data = response.data;
+        // 构建请求 URL
+        const searchUrl = `${site.api}?ac=detail&wd=${encodeURIComponent(keyword)}`;
+        const { data } = await fetchWithProxyFallback(searchUrl, { timeout: 8000 }, site.key);
+
         // 简单的数据清洗
         const result = {
             list: data.list ? data.list.map(item => ({
@@ -652,12 +815,11 @@ app.get('/api/detail', async (req, res) => {
 
     try {
         console.log(`[Detail] ${site.name} -> ID: ${id}`);
-        const response = await axios.get(site.api, {
-            params: { ac: 'detail', ids: id },
-            timeout: 8000
-        });
 
-        const data = response.data;
+        // 构建请求 URL
+        const detailUrl = `${site.api}?ac=detail&ids=${encodeURIComponent(id)}`;
+        const { data } = await fetchWithProxyFallback(detailUrl, { timeout: 8000 }, site.key);
+
         if (data.list && data.list.length > 0) {
             const detail = data.list[0];
             cacheManager.set('detail', cacheKey, detail, 3600); // 缓存1小时
@@ -689,12 +851,11 @@ app.post('/api/detail', async (req, res) => {
 
     try {
         console.log(`[Detail] ${site.name} -> ID: ${id}`);
-        const response = await axios.get(site.api, {
-            params: { ac: 'detail', ids: id },
-            timeout: 8000
-        });
 
-        const data = response.data;
+        // 构建请求 URL
+        const detailUrl = `${site.api}?ac=detail&ids=${encodeURIComponent(id)}`;
+        const { data } = await fetchWithProxyFallback(detailUrl, { timeout: 8000 }, siteKey);
+
         if (data.list && data.list.length > 0) {
             const detail = data.list[0];
             cacheManager.set('detail', cacheKey, detail, 3600); // 缓存1小时
@@ -718,23 +879,62 @@ app.get('/api/tmdb-image/:size/:filename', async (req, res) => {
         return res.status(400).send('Invalid parameters');
     }
 
+    const tmdbUrl = `https://image.tmdb.org/t/p/${size}/${filename}`;
+
+    // Vercel环境或Serverless环境：不可写文件系统，直接转发流
+    if (process.env.VERCEL) {
+        try {
+            // 支持自定义反代 URL
+            let targetUrl = tmdbUrl;
+            if (process.env['TMDB_PROXY_URL']) {
+                const proxyBase = process.env['TMDB_PROXY_URL'].replace(/\/$/, '');
+                targetUrl = `${proxyBase}/t/p/${size}/${filename}`;
+            }
+
+            console.log(`[Vercel Image] Proxying: ${targetUrl}`);
+            const response = await axios({
+                url: targetUrl,
+                method: 'GET',
+                responseType: 'stream',
+                timeout: 10000
+            });
+            // 缓存控制：公共缓存，有效期1天
+            res.setHeader('Cache-Control', 'public, max-age=86400, s-maxage=86400');
+            response.data.pipe(res);
+        } catch (error) {
+            console.error(`[Vercel Image Error] ${tmdbUrl}:`, error.message);
+            res.status(404).send('Image not found');
+        }
+        return;
+    }
+
+    // --- 本地/VPS 环境下启用磁盘缓存 ---
     const localPath = path.join(IMAGE_CACHE_DIR, size, filename);
     const localDir = path.dirname(localPath);
 
     // 1. 如果本地存在且文件大小 > 0，更新访问时间并返回
     if (fs.existsSync(localPath) && fs.statSync(localPath).size > 0) {
         // 更新文件的访问时间 (atime) 和修改时间 (mtime)，用于 LRU 清理
-        const now = new Date();
-        fs.utimesSync(localPath, now, now);
+        try {
+            const now = new Date();
+            fs.utimesSync(localPath, now, now);
+        } catch (e) { } // 忽略权限错误
         return res.sendFile(localPath);
     }
 
     // 2. 下载并缓存
     if (!fs.existsSync(localDir)) {
-        fs.mkdirSync(localDir, { recursive: true });
+        try {
+            fs.mkdirSync(localDir, { recursive: true });
+        } catch (e) {
+            console.error('[Cache Mkdir Error]', e.message);
+            // 如果创建目录失败，降级为直接流式转发
+            try {
+                const response = await axios({ url: tmdbUrl, method: 'GET', responseType: 'stream' });
+                return response.data.pipe(res);
+            } catch (err) { return res.status(404).send('Image not found'); }
+        }
     }
-
-    const tmdbUrl = `https://image.tmdb.org/t/p/${size}/${filename}`;
 
     try {
         console.log(`[Image Proxy] Fetching: ${tmdbUrl}`);
@@ -757,7 +957,9 @@ app.get('/api/tmdb-image/:size/:filename', async (req, res) => {
         res.sendFile(localPath);
     } catch (error) {
         console.error(`[Image Proxy Error] ${tmdbUrl}:`, error.message);
-        if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+        if (fs.existsSync(localPath)) {
+            try { fs.unlinkSync(localPath); } catch (e) { }
+        }
         res.status(404).send('Image not found');
     }
 });
